@@ -17,11 +17,11 @@ from mathutils import Vector
 cp = np
 cp.asnumpy = lambda x: np.asarray(x)  # shim: asnumpy is identity for numpy arrays
 print("Using NumPy (CPU) for computation — cupy skipped due to Blender numpy conflict")
+
 import subprocess
 import tempfile
 import multiprocessing
 import pickle
-import sys
 import shutil
 
 # ===============================================================
@@ -69,8 +69,6 @@ else:
         obj.select_set(True)
         bpy.ops.object.mode_set(mode='OBJECT')
         bpy.ops.object.transform_apply(scale=True)
-        # Uncomment the following line to apply location and rotation as well:
-        # bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
         obj.select_set(False)
     print("Object transformations applied.")
 
@@ -229,10 +227,12 @@ else:
                 bpy.context.scene.collection.objects.unlink(obj)
         mod = base_obj.modifiers.new(name="UnionAll", type='BOOLEAN')
         mod.operation = 'UNION'
+
         mod.solver = 'EXACT'
         mod.operand_type = 'COLLECTION'
         mod.collection = bool_collection
         mod.use_self = True
+        mod.material_mode = 'TRANSFER'
         bpy.ops.object.modifier_apply(modifier=mod.name)
         for obj in separated_objects[1:]:
             if obj != base_obj:
@@ -324,11 +324,10 @@ def is_inside_triangle(a, b, c, eps=1e-8):
     return -eps <= a <= 1.0+eps and -eps <= b <= 1.0+eps and -eps <= c <= 1.0+eps
 
 # ---------------------------
-# OPTIMIZED PIXEL GATHERING
+# OPTIMIZED PIXEL GATHERING (Modified for Multiple Textures)
 # ---------------------------
-def gather_used_pixels_optimized(obj, pil_image, max_sample=200000):
-    print("  Starting optimized pixel gathering...")
-    w, h = pil_image.size
+def gather_used_pixels_optimized(obj, material_to_pil, max_sample=200000):
+    print("  Starting optimized pixel gathering for multiple textures...")
     bm = bmesh.new()
     bm.from_mesh(obj.data)
     bm.faces.ensure_lookup_table()
@@ -340,22 +339,25 @@ def gather_used_pixels_optimized(obj, pil_image, max_sample=200000):
         return []
 
     used_pixels = []
-    total_faces = len(bm.faces)
-    processed_faces = 0
     total_uv_area = 0
+    # First pass: compute total UV area for faces with valid texture
     for face in bm.faces:
         if len(face.loops) < 3:
             continue
+        if face.material_index not in material_to_pil:
+            continue
         uvs = [l[uv_layer].uv for l in face.loops]
+        face_area = 0
         for i in range(1, len(uvs) - 1):
             a, b, c = uvs[0], uvs[i], uvs[i+1]
             area = 0.5 * abs((b.x - a.x)*(c.y - a.y) - (c.x - a.x)*(b.y - a.y))
-            total_uv_area += area
+            face_area += area
+        total_uv_area += face_area
 
-    target_sample_density = max_sample / (total_uv_area * w * h)
-    min_step = 1
+    target_sample_density = max_sample / total_uv_area if total_uv_area > 0 else 0
     print(f"  Target sample density: {target_sample_density:.6f}")
-    print(f"  Processing {total_faces} faces...")
+    total_faces = len(bm.faces)
+    processed_faces = 0
     start_time = time.time()
     last_report_time = start_time
     pixel_set = set()
@@ -363,6 +365,11 @@ def gather_used_pixels_optimized(obj, pil_image, max_sample=200000):
     for face in bm.faces:
         if len(face.loops) < 3:
             continue
+        if face.material_index not in material_to_pil:
+            continue
+
+        pil_image = material_to_pil[face.material_index]
+        w, h = pil_image.size
 
         loops = list(face.loops)
         uv_points = [l[uv_layer].uv for l in loops]
@@ -378,10 +385,10 @@ def gather_used_pixels_optimized(obj, pil_image, max_sample=200000):
             area = 0.5 * abs((b.x - a.x)*(c.y - a.y) - (c.x - a.x)*(b.y - a.y))
             face_area += area
 
-        area_ratio = face_area / total_uv_area
+        area_ratio = face_area / total_uv_area if total_uv_area > 0 else 0
         target_samples_in_face = max(10, int(area_ratio * max_sample))
         face_pixels = (max_x - min_x + 1) * (max_y - min_y + 1)
-        sample_step = max(min_step, int(math.sqrt(face_pixels / target_samples_in_face))) if face_pixels > 0 else 1
+        sample_step = max(1, int(math.sqrt(face_pixels / target_samples_in_face))) if face_pixels > 0 else 1
 
         for py in range(min_y, max_y + 1, sample_step):
             for px in range(min_x, max_x + 1, sample_step):
@@ -517,7 +524,6 @@ def run_kmeans_on_pixels_lab_optimized(pixel_list_lin, K=8, max_iter=10):
             centroids_cp[k] = data_lab_cp[idx]
         for iteration in range(max_iter):
             print(f"  K-means iteration {iteration+1}/{max_iter}")
-            iteration_start = time.time()
             new_centroids_cp = cp.zeros_like(centroids_cp)
             counts_cp = cp.zeros(K, dtype=cp.int32)
             for batch_start in range(0, n_samples, batch_size):
@@ -540,8 +546,7 @@ def run_kmeans_on_pixels_lab_optimized(pixel_list_lin, K=8, max_iter=10):
                     new_centroids_cp[k] = data_lab_cp[idx]
             delta = cp.sum((new_centroids_cp - centroids_cp)**2)
             centroids_cp = new_centroids_cp
-            iteration_end = time.time()
-            print(f"    Iteration completed in {iteration_end - iteration_start:.2f} seconds (delta={float(delta):.6f})")
+            print(f"    Iteration delta={float(delta):.6f}")
             if delta < 1e-6:
                 print(f"  Converged after {iteration+1} iterations!")
                 break
@@ -559,7 +564,6 @@ def run_kmeans_on_pixels_lab_optimized(pixel_list_lin, K=8, max_iter=10):
             centroids_cp[k] = data_lab_cp[idx]
         for iteration in range(max_iter):
             print(f"  K-means iteration {iteration+1}/{max_iter}")
-            iteration_start = time.time()
             distances = cp.sum((data_lab_cp[:, None, :] - centroids_cp[None, :, :])**2, axis=2)
             labels = cp.argmin(distances, axis=1)
             new_centroids_cp = cp.zeros_like(centroids_cp)
@@ -571,8 +575,7 @@ def run_kmeans_on_pixels_lab_optimized(pixel_list_lin, K=8, max_iter=10):
                     new_centroids_cp[k] = centroids_cp[k]
             delta = cp.sum((new_centroids_cp - centroids_cp)**2)
             centroids_cp = new_centroids_cp
-            iteration_end = time.time()
-            print(f"    Iteration completed in {iteration_end - iteration_start:.2f} seconds (delta={float(delta):.6f})")
+            print(f"    Iteration delta={float(delta):.6f}")
             if delta < 1e-6:
                 print(f"  Converged after {iteration+1} iterations!")
                 break
@@ -656,11 +659,11 @@ def create_materials_from_centroids(centroids_lin):
     return materials
 
 # ===============================================================
-# RAY-CAST + SKIP NON-UV'D FACES - OPTIMIZED
+# RAY-CAST + SKIP NON-UV'D FACES - OPTIMIZED (Modified for Multiple Textures)
 # ===============================================================
 def ray_cast_for_colored_face(bvh, origin_world, direction_world,
                               bm_orig, uv_layer_orig,
-                              image_pil, w, h,
+                              material_to_pil,
                               max_dist=1e10, max_steps=10):
     EPSILON = 1e-4
     remain_dist = max_dist
@@ -669,10 +672,10 @@ def ray_cast_for_colored_face(bvh, origin_world, direction_world,
         hit = bvh.ray_cast(cur_origin, direction_world, remain_dist)
         if hit[0] is None:
             return None
-        hit_location, hit_normal, hit_face_idx, hit_distance = hit
+        hit_location, hit_normal, hit_face_index, hit_distance = hit
         next_origin = hit_location + direction_world * EPSILON
-        color_lin = get_uv_color_from_face(bm_orig, uv_layer_orig, hit_face_idx,
-                                           hit_location, image_pil, w, h)
+        color_lin = get_uv_color_from_face(bm_orig, uv_layer_orig, hit_face_index,
+                                           hit_location, material_to_pil)
         if color_lin is not None:
             return (hit_location, color_lin)
         cur_origin = next_origin
@@ -681,13 +684,17 @@ def ray_cast_for_colored_face(bvh, origin_world, direction_world,
             break
     return None
 
-def get_uv_color_from_face(bm_orig, uv_layer, face_idx,
-                           hit_location_world, image_pil, w, h):
+def get_uv_color_from_face(bm_orig, uv_layer, face_idx, hit_location_world, material_to_pil):
     if face_idx < 0 or face_idx >= len(bm_orig.faces):
         return None
     face = bm_orig.faces[face_idx]
     if len(face.loops) < 3:
         return None
+    # Use the texture corresponding to the face's material
+    if face.material_index not in material_to_pil:
+        return None
+    image_pil = material_to_pil[face.material_index]
+    w, h = image_pil.size
     local_hit = hit_location_world.copy()
     loops = list(face.loops)
     A_co = loops[0].vert.co
@@ -738,7 +745,7 @@ def sample_texture_at_uv(u, v, image_pil, w, h):
     B_lin = srgb_to_linear(B_s / 255.0)
     return (R_lin, G_lin, B_lin)
 
-def ray_cast_through_face(bvh, face_center, face_normal, bm_orig, uv_layer_orig, image_pil, w, h):
+def ray_cast_through_face(bvh, face_center, face_normal, bm_orig, uv_layer_orig, material_to_pil):
     INSIDE_OFFSET = 0.0001
     MAX_DIST = 1.0
     CLOSE_ENOUGH = 0.0001
@@ -746,7 +753,7 @@ def ray_cast_through_face(bvh, face_center, face_normal, bm_orig, uv_layer_orig,
     start_pos = face_center - (face_normal * INSIDE_OFFSET)
     hit_info = ray_cast_for_colored_face(
         bvh, start_pos, face_normal,
-        bm_orig, uv_layer_orig, image_pil, w, h,
+        bm_orig, uv_layer_orig, material_to_pil,
         max_dist=MAX_DIST, max_steps=MAX_STEPS
     )
     if hit_info:
@@ -756,7 +763,7 @@ def ray_cast_through_face(bvh, face_center, face_normal, bm_orig, uv_layer_orig,
             return hit_info
     opposite_hit = ray_cast_for_colored_face(
         bvh, start_pos, -face_normal,
-        bm_orig, uv_layer_orig, image_pil, w, h,
+        bm_orig, uv_layer_orig, material_to_pil,
         max_dist=MAX_DIST, max_steps=MAX_STEPS
     )
     if hit_info and opposite_hit:
@@ -768,28 +775,34 @@ def ray_cast_through_face(bvh, face_center, face_normal, bm_orig, uv_layer_orig,
     return hit_info or opposite_hit
 
 # ---------------------------
-# GPU-BASED Stage 2 - F: Assign Clusters via Ray Casting
+# GPU-BASED Stage 2 - F: Assign Clusters via Ray Casting (Modified for Multiple Textures)
 # ---------------------------
-def step_F_gpu(remesh_obj, bvh, bm_orig, uv_layer_orig, pil_im, w, h,
+def step_F_gpu(remesh_obj, bvh, bm_orig, uv_layer_orig, material_to_pil,
                cluster_centroids_lin, cluster_centroids_lab):
     print("Stage 2 - F: Assigning clusters via GPU-based vectorized processing")
     stepF_start = time.time()
     face_indices = []
-    hit_colors = []  # For each face, store the hit color (R_lin, G_lin, B_lin) or None.
-    for face in remesh_obj.data.polygons:
+    hit_colors = []
+    total_faces = len(remesh_obj.data.polygons)
+    last_report = time.time()
+    for fi, face in enumerate(remesh_obj.data.polygons):
         face_indices.append(face.index)
         face_center_world = remesh_obj.matrix_world @ face.center
         face_normal_world = remesh_obj.matrix_world.to_3x3() @ face.normal
         face_normal_world.normalize()
         colored_hit = ray_cast_through_face(
             bvh, face_center_world, face_normal_world,
-            bm_orig, uv_layer_orig, pil_im, w, h
+            bm_orig, uv_layer_orig, material_to_pil
         )
         if colored_hit:
             _, color = colored_hit
             hit_colors.append(color)
         else:
             hit_colors.append(None)
+        now = time.time()
+        if now - last_report > 5:
+            print(f"  Ray casting: {fi+1}/{total_faces} faces ({(fi+1)/total_faces*100:.1f}%)")
+            last_report = now
     valid_face_indices = []
     valid_colors = []
     for idx, color in zip(face_indices, hit_colors):
@@ -819,37 +832,36 @@ def step_F_gpu(remesh_obj, bvh, bm_orig, uv_layer_orig, pil_im, w, h,
 def main_stage2():
     print("=== Part 2: Texture-based Color Transfer with Limited Palette ===")
     total_stage2_start = time.time()
-    print("Stage 2 - A: Acquiring final object and texture image")
+    print("Stage 2 - A: Acquiring final object and texture images")
     stepA_start = time.time()
     obj_list = [o for o in bpy.context.scene.objects if o.type == 'MESH']
     if not obj_list:
         raise RuntimeError("No mesh objects found in the current scene.")
     source_obj = obj_list[0]
-    image = None
-    for mat in source_obj.data.materials:
+
+    # Build mapping from material slot index to its texture (PIL image)
+    material_to_pil = {}
+    for i, mat in enumerate(source_obj.data.materials):
         if mat and mat.use_nodes:
             for nd in mat.node_tree.nodes:
                 if nd.type == 'TEX_IMAGE' and nd.image:
-                    image = nd.image
-                    break
-            if image:
-                break
-    if not image:
-        raise RuntimeError("No image found in material nodes on the final object.")
-    print(f"  Using image: {image.name} from {bpy.path.abspath(image.filepath)}")
+                    try:
+                        pil_im = get_image_as_pil(nd.image)
+                        material_to_pil[i] = pil_im
+                        print(f"  Material {mat.name} (index {i}) uses texture: {nd.image.name}")
+                        break
+                    except Exception as e:
+                        print(f"Failed to load image for material index {i}: {e}")
+    if not material_to_pil:
+        raise RuntimeError("No texture images found in any material nodes on the final object.")
     stepA_end = time.time()
     print(f"Stage 2 - A completed in {stepA_end - stepA_start:.2f} seconds")
 
-    print("Stage 2 - B: Loading texture as PIL image")
-    stepB_start = time.time()
-    pil_im = get_image_as_pil(image)
-    w, h = pil_im.size
-    stepB_end = time.time()
-    print(f"Stage 2 - B completed in {stepB_end - stepB_start:.2f} seconds")
+    print("Stage 2 - B: (Skipping single texture loading as multiple textures are used)")
 
     print("Stage 2 - C: Gathering used pixels and running K-means color clustering")
     stepC_start = time.time()
-    used_pixels = gather_used_pixels_optimized(source_obj, pil_im, max_sample=MAX_SAMPLING_SIZE)
+    used_pixels = gather_used_pixels_optimized(source_obj, material_to_pil, max_sample=MAX_SAMPLING_SIZE)
     if not used_pixels:
         raise RuntimeError("No used pixels found in the object's UV space.")
     print(f"  Total used pixels gathered: {len(used_pixels)}")
@@ -914,7 +926,7 @@ def main_stage2():
     uv_layer_orig = bm_orig.loops.layers.uv.active
 
     # GPU-based processing for assigning material indices (Stage 2 - F)
-    step_F_gpu(remesh_obj, bvh, bm_orig, uv_layer_orig, pil_im, w, h,
+    step_F_gpu(remesh_obj, bvh, bm_orig, uv_layer_orig, material_to_pil,
                cluster_centroids_lin, cluster_centroids_lab)
     bm_orig.free()
 
@@ -928,7 +940,7 @@ def main_stage2():
     stepG_end = time.time()
     print(f"Stage 2 - G completed in {stepG_end - stepG_start:.2f} seconds")
 
-    # --- NEW: Triangulation via BMesh ---
+    # --- Triangulation via BMesh ---
     print("Stage 2 - X: Triangulating final mesh")
     stepX_start = time.time()
     bm_triang = bmesh.new()
@@ -944,7 +956,7 @@ def main_stage2():
     bpy.ops.object.select_all(action='DESELECT')
     remesh_obj.select_set(True)
     bpy.context.view_layer.objects.active = remesh_obj
-    # Blender 4.x removed legacy OBJ exporter; use wavefront_obj addon or FBX fallback
+    # Blender 4.x uses wm.obj_export instead of legacy export_scene.obj
     try:
         bpy.ops.wm.obj_export(
             filepath=OBJ_EXPORT_PATH,
