@@ -27,8 +27,7 @@ import shutil
 # ===============================================================
 # FILE PATHS (Customize as needed)
 # ===============================================================
-#input_fbx  = r"C:\Users\jason\Downloads\autumn-house\source\House_scene_01.fbx"
-input_fbx  = r"C:\Users\jason\Documents\Chess Pieces\PelicanWithBase.fbx"
+input_fbx  = r"C:\Users\jason\Downloads\autumn-house\source\House_scene_01.fbx"
 # Define the export folder and ensure it exists
 export_folder = r"C:\Users\jason\Desktop\Exports"
 if not os.path.exists(export_folder):
