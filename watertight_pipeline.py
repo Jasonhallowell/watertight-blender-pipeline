@@ -27,8 +27,8 @@ import shutil
 # ===============================================================
 # FILE PATHS (Customize as needed)
 # ===============================================================
-input_fbx  = r"C:\Users\jason\Downloads\autumn-house\source\House_scene_01.fbx"
-
+#input_fbx  = r"C:\Users\jason\Downloads\autumn-house\source\House_scene_01.fbx"
+input_fbx  = r"C:\Users\jason\Documents\Chess Pieces\PelicanWithBase.fbx"
 # Define the export folder and ensure it exists
 export_folder = r"C:\Users\jason\Desktop\Exports"
 if not os.path.exists(export_folder):
@@ -40,6 +40,8 @@ TEXTURE_EXPORT_PATH = os.path.join(export_folder, "your_texture.png")
 debug_before_union_fbx = os.path.join(export_folder, "debug_before_union.fbx")
 debug_after_union_fbx  = os.path.join(export_folder, "debug_after_union.fbx")
 debug_after_remesh_fbx = os.path.join(export_folder, "debug_after_remesh.fbx")
+# New export for grid fill groups before deletion:
+debug_before_grid_fill_deletion_fbx = os.path.join(export_folder, "debug_before_grid_fill_deletion.fbx")
 
 # ===============================================================
 # PART 1: Clean the original FBX (merge doubles & fill holes)
@@ -69,8 +71,20 @@ else:
         obj.select_set(True)
         bpy.ops.object.mode_set(mode='OBJECT')
         bpy.ops.object.transform_apply(scale=True)
+        # Uncomment the following line to apply location and rotation as well:
+        # bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
         obj.select_set(False)
     print("Object transformations applied.")
+
+    # --- JOIN ALL MESH OBJECTS INTO ONE ---
+    print("Joining all mesh parts into one object...")
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in mesh_objects:
+        obj.select_set(True)
+    bpy.ops.object.join()
+    joined_obj = bpy.context.active_object
+    mesh_objects = [joined_obj]
+    print("Joined object:", joined_obj.name)
 
     # --- STEP 1: Process Each Mesh (Merge Vertices and Fill Holes) ---
     print("Step 1: Processing each mesh (merging vertices and filling holes)")
@@ -83,6 +97,8 @@ else:
 
         # Merge duplicate vertices
         bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.00001)
+        # Planar Dissolve: dissolve nearly coplanar edges/faces to simplify the mesh.
+        #bpy.ops.mesh.dissolve_limited(angle_limit=math.radians(2.0))
 
         # Detect boundary edges (edges with only one linked face)
         boundary_edges = {e for e in bm.edges if len(e.link_faces) == 1}
@@ -116,16 +132,36 @@ else:
                 if loop:
                     edge_loops.append(loop)
 
-        # Fill each detected loop
+        # --- Fill each detected loop and tag new faces ---
+        # Create (or get) a custom integer layer on BMFace for grid fill groups.
+        grid_fill_layer = bm.faces.layers.int.get("grid_fill_group")
+        if grid_fill_layer is None:
+            grid_fill_layer = bm.faces.layers.int.new("grid_fill_group")
+        grid_fill_group_id = 1  # Start with group ID 1
+
         for loop in edge_loops:
+            # Check if all edges in the loop belong to the same face.
+            faces_in_loop = {f for edge in loop for f in edge.link_faces}
+            if len(faces_in_loop) == 1:
+                print("Skipping grid fill for loop that belongs to a single face.")
+                continue
+
             bpy.ops.mesh.select_all(action='DESELECT')
             for edge in loop:
                 edge.select = True
-            bpy.ops.mesh.fill()
+
+            # Record current faces before grid fill
+            old_faces = set(bm.faces)
+            #bpy.ops.mesh.fill_grid(span=1, offset=0, use_interp_simple=False)
+            # Only tag new faces (the ones not present in old_faces and still selected)
+            new_faces = [f for f in bm.faces if f not in old_faces and f.select]
+            for f in new_faces:
+                f[grid_fill_layer] = grid_fill_group_id
+
+            grid_fill_group_id += 1
 
         bmesh.update_edit_mesh(obj.data)
         bpy.ops.object.mode_set(mode='OBJECT')
-
     step1_end = time.time()
     print(f"Step 1 completed in {step1_end - step1_start:.2f} seconds")
 
@@ -146,8 +182,9 @@ else:
     print(f"Step 2 completed in {step2_end - step2_start:.2f} seconds")
 
     # --- STEP 2.5: Mark overlapping coplanar faces in pink (debug) ---
-    print("Step 2.5: Marking overlapping coplanar faces in pink for debugging")
-    def mark_overlapping_faces(obj, distance_threshold=0.001, normal_dot_threshold=0.99):
+    print("Step 2.5: Marking debug faces in pink (overlapping coplanar) and purple (intersecting)")
+
+    def mark_overlapping_faces(obj, distance_threshold=0.001, normal_dot_threshold=0.99, epsilon=0.0001):
         # Create (or get) a debug pink material
         pink_mat = None
         for mat in bpy.data.materials:
@@ -157,7 +194,6 @@ else:
         if pink_mat is None:
             pink_mat = bpy.data.materials.new("Debug_Pink")
             pink_mat.diffuse_color = (1.0, 0.0, 1.0, 1.0)
-
         if pink_mat.name not in [m.name for m in obj.data.materials]:
             obj.data.materials.append(pink_mat)
         pink_index = obj.data.materials.find(pink_mat.name)
@@ -170,24 +206,227 @@ else:
         for face in bm.faces:
             center = face.calc_center_median()
             normal = face.normal
-            ray_origin = center + normal * 0.0001
-            hit = bvh.ray_cast(ray_origin, normal, distance_threshold)
-            if hit[0] is not None:
+            # Start the ray behind the face
+            ray_origin = center - normal * epsilon
+            remaining_dist = distance_threshold
+
+            # Try several times if the ray hits the same face
+            for _ in range(5):
+                hit = bvh.ray_cast(ray_origin, normal, remaining_dist)
+                if hit[0] is None:
+                    break
                 hit_loc, hit_normal, hit_face_index, hit_distance = hit
-                if hit_face_index != face.index:
-                    if normal.dot(hit_normal) >= normal_dot_threshold:
-                        face.material_index = pink_index
-                        try:
-                            bm.faces[hit_face_index].material_index = pink_index
-                        except Exception as e:
-                            print(f"Warning: Could not mark face {hit_face_index}: {e}")
+                if hit_face_index == face.index:
+                    # The ray hit the originating face; shift the origin forward and try again.
+                    ray_origin = hit_loc + normal * epsilon
+                    remaining_dist -= hit_distance + epsilon
+                    if remaining_dist <= 0:
+                        break
+                    continue
+                if normal.dot(hit_normal) >= normal_dot_threshold:
+                    face.material_index = pink_index
+                    try:
+                        bm.faces[hit_face_index].material_index = pink_index
+                    except Exception as e:
+                        print(f"Warning: Could not mark face {hit_face_index}: {e}")
+                break
+
         bm.to_mesh(obj.data)
         bm.free()
 
+    def mark_intersecting_faces(obj, epsilon=1e-4):
+        # Create (or get) a debug purple material
+        purple_mat = None
+        for mat in bpy.data.materials:
+            if mat.name == "Debug_Purple":
+                purple_mat = mat
+                break
+        if purple_mat is None:
+            purple_mat = bpy.data.materials.new("Debug_Purple")
+            purple_mat.diffuse_color = (0.5, 0.0, 0.5, 1.0)
+        if purple_mat.name not in [m.name for m in obj.data.materials]:
+            obj.data.materials.append(purple_mat)
+        purple_index = obj.data.materials.find(purple_mat.name)
+
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        # Build fan-triangulation for each face and record its vertex set.
+        face_tris = {}
+        face_verts = {}
+        for face in bm.faces:
+            verts = [loop.vert for loop in face.loops]
+            face_verts[face] = set(verts)
+            if len(verts) < 3:
+                continue
+            tris = []
+            v0 = verts[0].co.copy()
+            for i in range(1, len(verts) - 1):
+                v1 = verts[i].co.copy()
+                v2 = verts[i+1].co.copy()
+                area = 0.5 * (v1 - v0).cross(v2 - v0).length
+                if area < 1e-8:
+                    continue
+                tris.append((v0, v1, v2))
+            if tris:
+                face_tris[face] = tris
+
+        face_list = list(face_tris.keys())
+        n = len(face_list)
+        intersecting_faces = set()
+
+        # Iterate over all pairs of faces.
+        for i in range(n):
+            face_i = face_list[i]
+            tris_i = face_tris[face_i]
+            xs_i = [v.x for tri in tris_i for v in tri]
+            ys_i = [v.y for tri in tris_i for v in tri]
+            zs_i = [v.z for tri in tris_i for v in tri]
+            bbox_i = (min(xs_i), max(xs_i), min(ys_i), max(ys_i), min(zs_i), max(zs_i))
+            for j in range(i + 1, n):
+                face_j = face_list[j]
+                # Skip if faces share vertices (likely adjacent)
+                if face_verts[face_i] & face_verts[face_j]:
+                    continue
+                tris_j = face_tris[face_j]
+                xs_j = [v.x for tri in tris_j for v in tri]
+                ys_j = [v.y for tri in tris_j for v in tri]
+                zs_j = [v.z for tri in tris_j for v in tri]
+                bbox_j = (min(xs_j), max(xs_j), min(ys_j), max(ys_j), min(zs_j), max(zs_j))
+                # Quick bounding-box check.
+                def bbox_overlap(b1, b2):
+                    return not (b1[1] < b2[0] or b2[1] < b1[0] or
+                                b1[3] < b2[2] or b2[3] < b1[2] or
+                                b1[5] < b2[4] or b2[5] < b1[4])
+                if not bbox_overlap(bbox_i, bbox_j):
+                    continue
+                found = False
+                for tri_i in tris_i:
+                    for tri_j in tris_j:
+                        # Use the new triangles_intersect with an overlap tolerance.
+                        if triangles_intersect(tri_i, tri_j, epsilon=1e-4, overlap_tol=1e-3):
+                            intersecting_faces.add(face_i)
+                            intersecting_faces.add(face_j)
+                            found = True
+                            break
+                    if found:
+                        break
+
+        # Mark intersecting faces with the purple material.
+        for face in intersecting_faces:
+            face.material_index = purple_index
+
+        bm.to_mesh(obj.data)
+        bm.free()
+
+    # New unified triangles_intersect using an overlap tolerance.
+    def triangles_intersect(tri1, tri2, epsilon=1e-4, overlap_tol=1e-3):
+        # Helper: project a triangle onto an axis.
+        def project_triangle(tri, axis):
+            dots = [v.dot(axis) for v in tri]
+            return min(dots), max(dots)
+        # Helper: test if projections overlap on the given axis with tolerance.
+        def axis_test(axis, tri1, tri2):
+            if axis.length < epsilon:
+                return True  # Skip degenerate axis.
+            axis = axis.normalized()
+            min1, max1 = project_triangle(tri1, axis)
+            min2, max2 = project_triangle(tri2, axis)
+            overlap = min(max1, max2) - max(min1, min2)
+            if overlap < overlap_tol:
+                return False
+            return True
+
+        axes = []
+        # Normals of each triangle.
+        edge1 = tri1[1] - tri1[0]
+        edge2 = tri1[2] - tri1[0]
+        axes.append(edge1.cross(edge2))
+        edge1 = tri2[1] - tri2[0]
+        edge2 = tri2[2] - tri2[0]
+        axes.append(edge1.cross(edge2))
+        # Cross products of edges.
+        edges1 = [tri1[1] - tri1[0], tri1[2] - tri1[1], tri1[0] - tri1[2]]
+        edges2 = [tri2[1] - tri2[0], tri2[2] - tri2[1], tri2[0] - tri2[2]]
+        for e1 in edges1:
+            for e2 in edges2:
+                axes.append(e1.cross(e2))
+        for axis in axes:
+            if not axis_test(axis, tri1, tri2):
+                return False
+        return True
+
+    # Now run both debug marking routines on each separated mesh object:
     for obj in separated_objects:
         if obj.type == 'MESH':
             mark_overlapping_faces(obj, distance_threshold=0.0001, normal_dot_threshold=0.99)
+            mark_intersecting_faces(obj, epsilon=1e-4)
+
     print("Step 2.5 completed.")
+
+    # --- STEP 2.6: Delete grid fill groups with pink or purple faces ---
+    print("Step 2.6: Deleting grid fill groups with pink or purple faces")
+    # Export debug FBX before deletion of grid fill groups
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in separated_objects:
+        if obj.type == 'MESH':
+            obj.select_set(True)
+    bpy.ops.export_scene.fbx(
+        filepath=debug_before_grid_fill_deletion_fbx,
+        use_selection=True,
+        axis_forward='-Z',
+        axis_up='Y'
+    )
+    print(f"Exported debug FBX before deletion of grid fill groups to: {debug_before_grid_fill_deletion_fbx}")
+
+    for obj in separated_objects:
+        if obj.type == 'MESH':
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bm = bmesh.from_edit_mesh(obj.data)
+            grid_fill_layer = bm.faces.layers.int.get("grid_fill_group")
+            if grid_fill_layer:
+                # Group faces by grid fill group id (skip default value 0)
+                groups = {}
+                for face in bm.faces:
+                    group_val = face[grid_fill_layer]
+                    if group_val != 0:
+                        groups.setdefault(group_val, []).append(face)
+                # Determine the Debug_Pink and Debug_Purple material indices
+                pink_index = -1
+                purple_index = -1
+                for mat in obj.data.materials:
+                    if mat.name == "Debug_Pink":
+                        pink_index = obj.data.materials.find(mat.name)
+                    elif mat.name == "Debug_Purple":
+                        purple_index = obj.data.materials.find(mat.name)
+                # Delete groups if any face is marked with Debug_Pink or Debug_Purple
+                for group_id, faces in groups.items():
+                    if any(face.material_index == pink_index or face.material_index == purple_index for face in faces):
+                        print(f"  Deleting grid fill group {group_id} with debug faces on {obj.name}")
+                        bmesh.ops.delete(bm, geom=faces, context='FACES')
+            bmesh.update_edit_mesh(obj.data)
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+    # --- STEP 2.7: Solidify objects with boundary edges ---
+    print("Step 2.7: Solidifying objects with boundary edges")
+    for obj in separated_objects:
+        if obj.type == 'MESH':
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bm = bmesh.from_edit_mesh(obj.data)
+            # Identify boundary edges (edges with only one linked face)
+            boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+            if boundary_edges:
+                bpy.ops.object.mode_set(mode='OBJECT')
+                print(f"  {obj.name} has {len(boundary_edges)} boundary edges. Applying solidify...")
+                mod = obj.modifiers.new(name="Solidify_Boundary", type='SOLIDIFY')
+                mod.thickness = 0.001  # Adjust thickness as needed
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.object.modifier_apply(modifier=mod.name)
+            else:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            bm.free()
 
     # --- STEP 3: Single Collection-Based Boolean Union ---
     print("Step 3: Performing single collection-based Boolean Union")
@@ -227,7 +466,6 @@ else:
                 bpy.context.scene.collection.objects.unlink(obj)
         mod = base_obj.modifiers.new(name="UnionAll", type='BOOLEAN')
         mod.operation = 'UNION'
-
         mod.solver = 'EXACT'
         mod.operand_type = 'COLLECTION'
         mod.collection = bool_collection
@@ -372,7 +610,7 @@ def gather_used_pixels_optimized(obj, material_to_pil, max_sample=200000):
         w, h = pil_image.size
 
         loops = list(face.loops)
-        uv_points = [l[uv_layer].uv for l in loops]
+        uv_points = [l[uv_layer].uv for l in face.loops]
         uv_pixels = [(uv.x * w, (1.0 - uv.y) * h) for uv in uv_points]
         min_x = max(0, int(math.floor(min(p[0] for p in uv_pixels))))
         max_x = min(w - 1, int(math.ceil(max(p[0] for p in uv_pixels))))
@@ -659,7 +897,7 @@ def create_materials_from_centroids(centroids_lin):
     return materials
 
 # ===============================================================
-# RAY-CAST + SKIP NON-UV'D FACES - OPTIMIZED (Modified for Multiple Textures)
+# RAY-CAST + SKIP NON-UV'd FACES - OPTIMIZED (Modified for Multiple Textures)
 # ===============================================================
 def ray_cast_for_colored_face(bvh, origin_world, direction_world,
                               bm_orig, uv_layer_orig,
@@ -782,7 +1020,7 @@ def step_F_gpu(remesh_obj, bvh, bm_orig, uv_layer_orig, material_to_pil,
     print("Stage 2 - F: Assigning clusters via GPU-based vectorized processing")
     stepF_start = time.time()
     face_indices = []
-    hit_colors = []
+    hit_colors = []  # For each face, store the hit color (R_lin, G_lin, B_lin) or None.
     total_faces = len(remesh_obj.data.polygons)
     last_report = time.time()
     for fi, face in enumerate(remesh_obj.data.polygons):
@@ -849,7 +1087,7 @@ def main_stage2():
                         pil_im = get_image_as_pil(nd.image)
                         material_to_pil[i] = pil_im
                         print(f"  Material {mat.name} (index {i}) uses texture: {nd.image.name}")
-                        break
+                        break  # Use the first found texture for this material
                     except Exception as e:
                         print(f"Failed to load image for material index {i}: {e}")
     if not material_to_pil:
@@ -966,15 +1204,15 @@ def main_stage2():
             up_axis='Y'
         )
     except Exception as e:
-        print(f"OBJ export failed ({e}), falling back to FBX export")
-        fbx_path = OBJ_EXPORT_PATH.replace('.obj', '.fbx')
-        bpy.ops.export_scene.fbx(
-            filepath=fbx_path,
+        print(f"wm.obj_export failed ({e}), trying legacy export_scene.obj...")
+        bpy.ops.export_scene.obj(
+            filepath=OBJ_EXPORT_PATH,
             use_selection=True,
+            use_materials=True,
+            path_mode='AUTO',
             axis_forward='-Z',
             axis_up='Y'
         )
-        print(f"Exported as FBX instead: {fbx_path}")
     stepH_end = time.time()
     print(f"Stage 2 - H completed in {stepH_end - stepH_start:.2f} seconds")
 
