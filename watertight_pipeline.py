@@ -1118,28 +1118,21 @@ def main_stage2():
     stepD_end = time.time()
     print(f"Stage 2 - D completed in {stepD_end - stepD_start:.2f} seconds")
 
-    print("Stage 2 - E: Duplicating and Remeshing the final object")
+    print("Stage 2 - E: Duplicating the final object (remesh disabled)")
     stepE_start = time.time()
     remesh_obj = source_obj.copy()
     remesh_obj.data = source_obj.data.copy()
     remesh_obj.name = source_obj.name + "_Remeshed"
     bpy.context.collection.objects.link(remesh_obj)
-    smooth_mod = remesh_obj.modifiers.new(name="SmoothRemesh", type='REMESH')
-    smooth_mod.mode = 'SMOOTH'
-    smooth_mod.octree_depth = 9
-    smooth_mod.scale = 0.999
-    smooth_mod.use_remove_disconnected = False
-    bpy.context.view_layer.objects.active = remesh_obj
-    bpy.ops.object.modifier_apply(modifier=smooth_mod.name)
-    bpy.ops.object.select_all(action='DESELECT')
-    remesh_obj.select_set(True)
-    bpy.ops.export_scene.fbx(
-        filepath=debug_after_remesh_fbx,
-        use_selection=True,
-        axis_forward='-Z',
-        axis_up='Y'
-    )
-    print(f"Exported debug FBX after remesh to: {debug_after_remesh_fbx}")
+    # Smooth remesh disabled — it was destroying thin walls/roofs.
+    # The boolean union in Part 1 already produces a watertight mesh.
+    #smooth_mod = remesh_obj.modifiers.new(name="SmoothRemesh", type='REMESH')
+    #smooth_mod.mode = 'SMOOTH'
+    #smooth_mod.octree_depth = 9
+    #smooth_mod.scale = 0.999
+    #smooth_mod.use_remove_disconnected = False
+    #bpy.context.view_layer.objects.active = remesh_obj
+    #bpy.ops.object.modifier_apply(modifier=smooth_mod.name)
     stepE_end = time.time()
     print(f"Stage 2 - E completed in {stepE_end - stepE_start:.2f} seconds")
 
